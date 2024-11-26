@@ -1,8 +1,10 @@
 import gc
 import re
+import typing as t
 import uuid
 import warnings
 import weakref
+from contextlib import nullcontext
 from datetime import datetime
 from datetime import timezone
 from platform import python_implementation
@@ -18,7 +20,6 @@ from werkzeug.routing import BuildError
 from werkzeug.routing import RequestRedirect
 
 import flask
-
 
 require_cpython_gc = pytest.mark.skipif(
     python_implementation() != "CPython",
@@ -190,7 +191,8 @@ def test_url_mapping(app, client):
 
 
 def test_werkzeug_routing(app, client):
-    from werkzeug.routing import Submount, Rule
+    from werkzeug.routing import Rule
+    from werkzeug.routing import Submount
 
     app.url_map.add(
         Submount("/foo", [Rule("/bar", endpoint="bar"), Rule("/", endpoint="index")])
@@ -210,7 +212,8 @@ def test_werkzeug_routing(app, client):
 
 
 def test_endpoint_decorator(app, client):
-    from werkzeug.routing import Submount, Rule
+    from werkzeug.routing import Rule
+    from werkzeug.routing import Submount
 
     app.url_map.add(
         Submount("/foo", [Rule("/bar", endpoint="bar"), Rule("/", endpoint="index")])
@@ -292,6 +295,7 @@ def test_session_using_session_settings(app, client):
         SESSION_COOKIE_DOMAIN=".example.com",
         SESSION_COOKIE_HTTPONLY=False,
         SESSION_COOKIE_SECURE=True,
+        SESSION_COOKIE_PARTITIONED=True,
         SESSION_COOKIE_SAMESITE="Lax",
         SESSION_COOKIE_PATH="/",
     )
@@ -314,6 +318,7 @@ def test_session_using_session_settings(app, client):
     assert "secure" in cookie
     assert "httponly" not in cookie
     assert "samesite" in cookie
+    assert "partitioned" in cookie
 
     rv = client.get("/clear", "http://www.example.com:8080/test/")
     cookie = rv.headers["set-cookie"].lower()
@@ -323,6 +328,7 @@ def test_session_using_session_settings(app, client):
     assert "path=/" in cookie
     assert "secure" in cookie
     assert "samesite" in cookie
+    assert "partitioned" in cookie
 
 
 def test_session_using_samesite_attribute(app, client):
@@ -363,6 +369,27 @@ def test_missing_session(app):
         assert flask.session.get("missing_key") is None
         expect_exception(flask.session.__setitem__, "foo", 42)
         expect_exception(flask.session.pop, "foo")
+
+
+def test_session_secret_key_fallbacks(app, client) -> None:
+    @app.post("/")
+    def set_session() -> str:
+        flask.session["a"] = 1
+        return ""
+
+    @app.get("/")
+    def get_session() -> dict[str, t.Any]:
+        return dict(flask.session)
+
+    # Set session with initial secret key
+    client.post()
+    assert client.get().json == {"a": 1}
+    # Change secret key, session can't be loaded and appears empty
+    app.secret_key = "new test key"
+    assert client.get().json == {}
+    # Add initial secret key as fallback, session can be loaded
+    app.config["SECRET_KEY_FALLBACKS"] = ["test key"]
+    assert client.get().json == {"a": 1}
 
 
 def test_session_expiration(app, client):
@@ -431,9 +458,9 @@ def test_session_special_types(app, client):
         client.get("/")
         s = flask.session
         assert s["t"] == (1, 2, 3)
-        assert type(s["b"]) == bytes
+        assert type(s["b"]) is bytes  # noqa: E721
         assert s["b"] == b"\xff"
-        assert type(s["m"]) == Markup
+        assert type(s["m"]) is Markup  # noqa: E721
         assert s["m"] == Markup("<html>")
         assert s["u"] == the_uuid
         assert s["d"] == now
@@ -760,7 +787,7 @@ def test_teardown_request_handler_error(app, client):
 
     @app.teardown_request
     def teardown_request1(exc):
-        assert type(exc) == ZeroDivisionError
+        assert type(exc) is ZeroDivisionError
         called.append(True)
         # This raises a new error and blows away sys.exc_info(), so we can
         # test that all teardown_requests get passed the same original
@@ -772,7 +799,7 @@ def test_teardown_request_handler_error(app, client):
 
     @app.teardown_request
     def teardown_request2(exc):
-        assert type(exc) == ZeroDivisionError
+        assert type(exc) is ZeroDivisionError
         called.append(True)
         # This raises a new error and blows away sys.exc_info(), so we can
         # test that all teardown_requests get passed the same original
@@ -784,7 +811,7 @@ def test_teardown_request_handler_error(app, client):
 
     @app.route("/")
     def fails():
-        1 // 0
+        raise ZeroDivisionError
 
     rv = client.get("/")
     assert rv.status_code == 500
@@ -851,7 +878,7 @@ def test_error_handling(app, client):
 
     @app.route("/error")
     def error():
-        1 // 0
+        raise ZeroDivisionError
 
     @app.route("/forbidden")
     def error2():
@@ -877,7 +904,7 @@ def test_error_handling_processing(app, client):
 
     @app.route("/")
     def broken_func():
-        1 // 0
+        raise ZeroDivisionError
 
     @app.after_request
     def after_request(resp):
@@ -1047,12 +1074,13 @@ def test_error_handler_after_processor_error(app, client):
     @app.before_request
     def before_request():
         if _trigger == "before":
-            1 // 0
+            raise ZeroDivisionError
 
     @app.after_request
     def after_request(response):
         if _trigger == "after":
-            1 // 0
+            raise ZeroDivisionError
+
         return response
 
     @app.route("/")
@@ -1456,6 +1484,48 @@ def test_request_locals():
     assert not flask.g
 
 
+@pytest.mark.parametrize(
+    ("subdomain_matching", "host_matching", "expect_base", "expect_abc", "expect_xyz"),
+    [
+        (False, False, "default", "default", "default"),
+        (True, False, "default", "abc", "<invalid>"),
+        (False, True, "default", "abc", "default"),
+    ],
+)
+def test_server_name_matching(
+    subdomain_matching: bool,
+    host_matching: bool,
+    expect_base: str,
+    expect_abc: str,
+    expect_xyz: str,
+) -> None:
+    app = flask.Flask(
+        __name__,
+        subdomain_matching=subdomain_matching,
+        host_matching=host_matching,
+        static_host="example.test" if host_matching else None,
+    )
+    app.config["SERVER_NAME"] = "example.test"
+
+    @app.route("/", defaults={"name": "default"}, host="<name>")
+    @app.route("/", subdomain="<name>", host="<name>.example.test")
+    def index(name: str) -> str:
+        return name
+
+    client = app.test_client()
+
+    r = client.get(base_url="http://example.test")
+    assert r.text == expect_base
+
+    r = client.get(base_url="http://abc.example.test")
+    assert r.text == expect_abc
+
+    with pytest.warns() if subdomain_matching else nullcontext():
+        r = client.get(base_url="http://xyz.other.test")
+
+    assert r.text == expect_xyz
+
+
 def test_server_name_subdomain():
     app = flask.Flask(__name__, subdomain_matching=True)
     client = app.test_client()
@@ -1507,7 +1577,7 @@ def test_exception_propagation(app, client, key):
 
     @app.route("/")
     def index():
-        1 // 0
+        raise ZeroDivisionError
 
     if key is not None:
         app.config[key] = True
@@ -1534,27 +1604,6 @@ def test_werkzeug_passthrough_errors(
     monkeypatch.setattr(werkzeug.serving, "run_simple", run_simple_mock)
     app.config["PROPAGATE_EXCEPTIONS"] = propagate_exceptions
     app.run(debug=debug, use_debugger=use_debugger, use_reloader=use_reloader)
-
-
-def test_max_content_length(app, client):
-    app.config["MAX_CONTENT_LENGTH"] = 64
-
-    @app.before_request
-    def always_first():
-        flask.request.form["myfile"]
-        AssertionError()
-
-    @app.route("/accept", methods=["POST"])
-    def accept_file():
-        flask.request.form["myfile"]
-        AssertionError()
-
-    @app.errorhandler(413)
-    def catcher(error):
-        return "42"
-
-    rv = client.post("/accept", data={"myfile": "foo" * 100})
-    assert rv.data == b"42"
 
 
 def test_url_processors(app, client):

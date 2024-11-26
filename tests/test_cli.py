@@ -1,6 +1,8 @@
 # This file was part of Flask-CLI and was modified under the terms of
 # its Revised BSD License. Copyright © 2015 CERN.
+import importlib.metadata
 import os
+import platform
 import ssl
 import sys
 import types
@@ -227,10 +229,6 @@ def test_locate_app_suppress_raise(test_apps):
 
 
 def test_get_version(test_apps, capsys):
-    from flask import __version__ as flask_version
-    from werkzeug import __version__ as werkzeug_version
-    from platform import python_version
-
     class MockCtx:
         resilient_parsing = False
         color = None
@@ -241,9 +239,9 @@ def test_get_version(test_apps, capsys):
     ctx = MockCtx()
     get_version(ctx, None, "test")
     out, err = capsys.readouterr()
-    assert f"Python {python_version()}" in out
-    assert f"Flask {flask_version}" in out
-    assert f"Werkzeug {werkzeug_version}" in out
+    assert f"Python {platform.python_version()}" in out
+    assert f"Flask {importlib.metadata.version('flask')}" in out
+    assert f"Werkzeug {importlib.metadata.version('werkzeug')}" in out
 
 
 def test_scriptinfo(test_apps, monkeypatch):
@@ -400,7 +398,12 @@ def test_flaskgroup_nested(app, runner):
 def test_no_command_echo_loading_error():
     from flask.cli import cli
 
-    runner = CliRunner(mix_stderr=False)
+    try:
+        runner = CliRunner(mix_stderr=False)
+    except (DeprecationWarning, TypeError):
+        # Click >= 8.2
+        runner = CliRunner()
+
     result = runner.invoke(cli, ["missing"])
     assert result.exit_code == 2
     assert "FLASK_APP" in result.stderr
@@ -410,7 +413,12 @@ def test_no_command_echo_loading_error():
 def test_help_echo_loading_error():
     from flask.cli import cli
 
-    runner = CliRunner(mix_stderr=False)
+    try:
+        runner = CliRunner(mix_stderr=False)
+    except (DeprecationWarning, TypeError):
+        # Click >= 8.2
+        runner = CliRunner()
+
     result = runner.invoke(cli, ["--help"])
     assert result.exit_code == 0
     assert "FLASK_APP" in result.stderr
@@ -422,7 +430,13 @@ def test_help_echo_exception():
         raise Exception("oh no")
 
     cli = FlaskGroup(create_app=create_app)
-    runner = CliRunner(mix_stderr=False)
+
+    try:
+        runner = CliRunner(mix_stderr=False)
+    except (DeprecationWarning, TypeError):
+        # Click >= 8.2
+        runner = CliRunner()
+
     result = runner.invoke(cli, ["--help"])
     assert result.exit_code == 0
     assert "Exception: oh no" in result.stderr
@@ -539,7 +553,7 @@ def test_load_dotenv(monkeypatch):
     # test env file encoding
     assert os.environ["HAM"] == "火腿"
     # Non existent file should not load
-    assert not load_dotenv("non-existent-file")
+    assert not load_dotenv("non-existent-file", load_defaults=False)
 
 
 @need_dotenv
@@ -681,3 +695,8 @@ def test_cli_empty(app):
 
     result = app.test_cli_runner().invoke(args=["blue", "--help"])
     assert result.exit_code == 2, f"Unexpected success:\n\n{result.output}"
+
+
+def test_run_exclude_patterns():
+    ctx = run_command.make_context("run", ["--exclude-patterns", __file__])
+    assert ctx.params["exclude_patterns"] == [__file__]
